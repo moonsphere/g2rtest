@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+package g2r;
+
+message Request {
+  int32 number = 1;
+  string message = 2;
+  repeated string tags = 3;
+}
+
+message Response {
+  int32 code = 1;
+  string message = 2;
+}
