@@ -10,29 +10,16 @@ use std::{
     task::Waker,
 };
 
-#[cfg(not(all(feature = "monoio", feature = "tpc")))]
 use parking_lot::Mutex;
-#[cfg(not(all(feature = "monoio", feature = "tpc")))]
 use std::sync::Arc;
 
-#[cfg(all(feature = "monoio", feature = "tpc"))]
-use std::{cell::UnsafeCell, rc::Rc};
-
-#[cfg(feature = "monoio")]
-use local_sync::oneshot::{channel, Receiver, Sender};
-
-#[cfg(all(feature = "tokio", not(feature = "monoio")))]
 use tokio::sync::oneshot::{channel, Receiver, Sender};
 
-#[cfg(feature = "monoio")]
-use monoio::{select, spawn};
-#[cfg(all(feature = "tokio", not(feature = "monoio")))]
 use tokio::{select, spawn};
 
-use crate::{
-    eventfd::{new_pair, Awaiter, Notifier},
-    util::yield_now,
-};
+use tokio::task::yield_now;
+
+use crate::eventfd::{new_pair, Awaiter, Notifier};
 
 pub struct Guard {
     _rx: Receiver<()>,
@@ -41,7 +28,6 @@ pub struct Guard {
 pub struct ReadQueue<T> {
     queue: Queue<T>,
     unstuck_notifier: Notifier,
-    #[cfg(all(feature = "tokio", not(feature = "monoio")))]
     tokio_handle: Option<tokio::runtime::Handle>,
 }
 
@@ -60,18 +46,6 @@ impl<T> ReadQueue<T> {
         maybe_item
     }
 
-    #[cfg(feature = "monoio")]
-    pub fn run_handler(self, handler: impl FnMut(T) + 'static) -> Result<Guard, io::Error>
-    where
-        T: 'static,
-    {
-        let working_awaiter = unsafe { Awaiter::from_raw_fd(self.queue.working_fd)? };
-        let (tx, rx) = channel();
-        spawn(self.working_handler(working_awaiter, handler, tx));
-        Ok(Guard { _rx: rx })
-    }
-
-    #[cfg(all(feature = "tokio", not(feature = "monoio")))]
     pub fn run_handler(self, handler: impl FnMut(T) + Send + 'static) -> Result<Guard, io::Error>
     where
         T: Send + 'static,
@@ -86,44 +60,6 @@ impl<T> ReadQueue<T> {
         Ok(Guard { _rx: rx })
     }
 
-    #[cfg(feature = "monoio")]
-    async fn working_handler(
-        mut self,
-        mut working_awaiter: Awaiter,
-        mut handler: impl FnMut(T),
-        mut tx: Sender<()>,
-    ) {
-        const YIELD_CNT: u8 = 3;
-        let mut exit = std::pin::pin!(tx.closed());
-        self.queue.mark_working();
-
-        'p: loop {
-            while let Some(item) = self.pop() {
-                handler(item);
-            }
-
-            for _ in 0..YIELD_CNT {
-                yield_now().await;
-                if !self.queue.is_empty() {
-                    continue 'p;
-                }
-            }
-
-            if !self.queue.mark_unworking() {
-                continue;
-            }
-
-            select! {
-                _ = working_awaiter.wait() => (),
-                _ = &mut exit => {
-                    return;
-                }
-            }
-            self.queue.mark_working();
-        }
-    }
-
-    #[cfg(all(feature = "tokio", not(feature = "monoio")))]
     async fn working_handler(
         mut self,
         mut working_awaiter: Awaiter,
@@ -164,14 +100,8 @@ impl<T> ReadQueue<T> {
 }
 
 pub struct WriteQueue<T> {
-    #[cfg(not(all(feature = "monoio", feature = "tpc")))]
     inner: Arc<Mutex<WriteQueueInner<T>>>,
-    #[cfg(all(feature = "monoio", feature = "tpc"))]
-    inner: Rc<UnsafeCell<WriteQueueInner<T>>>,
-    #[cfg(not(all(feature = "monoio", feature = "tpc")))]
     working_notifier: Arc<Notifier>,
-    #[cfg(all(feature = "monoio", feature = "tpc"))]
-    working_notifier: Rc<Notifier>,
 }
 
 impl<T> Clone for WriteQueue<T> {
@@ -187,15 +117,11 @@ impl<T> WriteQueue<T> {
     // Return if the item is put into queue or pending tasks.
     // Note if the task is put into pending tasks, it will be sent to queue when the queue is not full.
     pub fn push(&self, item: T) -> bool {
-        #[cfg(not(all(feature = "monoio", feature = "tpc")))]
         let mut inner = self.inner.lock();
-        #[cfg(all(feature = "monoio", feature = "tpc"))]
-        let inner = unsafe { &mut *self.inner.get() };
         let item = match inner.queue.push(item) {
             Ok(_) => {
                 if !inner.queue.working() {
                     inner.queue.mark_working();
-                    #[cfg(not(all(feature = "monoio", feature = "tpc")))]
                     drop(inner);
                     let _ = self.working_notifier.notify();
                 }
@@ -217,10 +143,7 @@ impl<T> WriteQueue<T> {
     // Return if the item is put into queue or pending tasks.
     // Note if the task is put into pending tasks, it will be sent to queue when the queue is not full.
     pub fn push_without_notify(&self, item: T) -> bool {
-        #[cfg(not(all(feature = "monoio", feature = "tpc")))]
         let mut inner = self.inner.lock();
-        #[cfg(all(feature = "monoio", feature = "tpc"))]
-        let inner = unsafe { &mut *self.inner.get() };
         let item = match inner.queue.push(item) {
             Ok(_) => return true,
             Err(item) => item,
@@ -238,43 +161,32 @@ impl<T> WriteQueue<T> {
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        #[cfg(not(all(feature = "monoio", feature = "tpc")))]
         let inner = self.inner.lock();
-        #[cfg(all(feature = "monoio", feature = "tpc"))]
-        let inner = unsafe { &*self.inner.get() };
         inner.queue.is_empty()
     }
 
     // If peer is not working, notify it and mark it working.
     // Return notified
     pub fn notify_manually(&self) -> bool {
-        #[cfg(not(all(feature = "monoio", feature = "tpc")))]
         let inner = self.inner.lock();
-        #[cfg(all(feature = "monoio", feature = "tpc"))]
-        let inner = unsafe { &mut *self.inner.get() };
 
         if inner.queue.working() {
             return false;
         }
 
         inner.queue.mark_working();
-        #[cfg(not(all(feature = "monoio", feature = "tpc")))]
         drop(inner);
         let _ = self.working_notifier.notify();
         true
     }
 
     pub fn push_with_awaiter(&self, item: T) -> PushResult {
-        #[cfg(not(all(feature = "monoio", feature = "tpc")))]
         let mut inner = self.inner.lock();
-        #[cfg(all(feature = "monoio", feature = "tpc"))]
-        let inner = unsafe { &mut *self.inner.get() };
 
         let item = match inner.queue.push(item) {
             Ok(_) => {
                 if !inner.queue.working() {
                     inner.queue.mark_working();
-                    #[cfg(not(all(feature = "monoio", feature = "tpc")))]
                     drop(inner);
                     let _ = self.working_notifier.notify();
                 }
@@ -285,10 +197,7 @@ impl<T> WriteQueue<T> {
 
         // The queue is full now
         inner.queue.mark_stuck();
-        #[cfg(not(all(feature = "monoio", feature = "tpc")))]
         let waker_slot = Arc::new(Mutex::new(WakerSlot::None));
-        #[cfg(all(feature = "monoio", feature = "tpc"))]
-        let waker_slot = Rc::new(UnsafeCell::new(WakerSlot::None));
         let pending = PendingTask {
             data: Some(item),
             waiter: Some(waker_slot.clone()),
@@ -302,22 +211,14 @@ impl<T> WriteQueue<T> {
         let mut exit = std::pin::pin!(tx.closed());
         loop {
             {
-                #[cfg(not(all(feature = "monoio", feature = "tpc")))]
                 let mut inner = self.inner.lock();
-                #[cfg(all(feature = "monoio", feature = "tpc"))]
-                let inner = unsafe { &mut *self.inner.get() };
 
                 while let Some(mut pending_task) = inner.pending_tasks.pop_front() {
                     let data = pending_task.data.take().unwrap();
                     match inner.queue.push(data) {
                         Ok(_) => {
                             if let Some(waiter) = pending_task.waiter {
-                                #[cfg(not(all(feature = "monoio", feature = "tpc")))]
                                 waiter.lock().wake();
-                                #[cfg(all(feature = "monoio", feature = "tpc"))]
-                                unsafe {
-                                    (*waiter.get()).wake()
-                                };
                             }
                         }
                         Err(data) => {
@@ -358,13 +259,8 @@ pub struct WriteQueueInner<T> {
 impl<T> WriteQueue<T> {
     #[inline]
     pub fn meta(&self) -> QueueMeta {
-        #[cfg(not(all(feature = "monoio", feature = "tpc")))]
         {
             self.inner.lock().queue.meta()
-        }
-        #[cfg(all(feature = "monoio", feature = "tpc"))]
-        {
-            unsafe { (*self.inner.get()).queue.meta() }
         }
     }
 }
@@ -372,10 +268,7 @@ impl<T> WriteQueue<T> {
 struct PendingTask<T> {
     // always Some, Option is for taking temporary
     data: Option<T>,
-    #[cfg(not(all(feature = "monoio", feature = "tpc")))]
     waiter: Option<Arc<Mutex<WakerSlot>>>,
-    #[cfg(all(feature = "monoio", feature = "tpc"))]
-    waiter: Option<Rc<UnsafeCell<WakerSlot>>>,
 }
 
 enum WakerSlot {
@@ -524,12 +417,10 @@ impl<T> Queue<T> {
         ReadQueue {
             queue: self,
             unstuck_notifier,
-            #[cfg(all(feature = "tokio", not(feature = "monoio")))]
             tokio_handle: None,
         }
     }
 
-    #[cfg(all(feature = "tokio", not(feature = "monoio")))]
     pub fn read_with_tokio_handle(self, tokio_handle: tokio::runtime::Handle) -> ReadQueue<T> {
         let unstuck_notifier = unsafe { Notifier::from_raw_fd(self.unstuck_fd) };
         ReadQueue {
@@ -539,40 +430,6 @@ impl<T> Queue<T> {
         }
     }
 
-    #[cfg(feature = "monoio")]
-    pub fn write(self) -> Result<WriteQueue<T>, io::Error>
-    where
-        T: 'static,
-    {
-        let working_notifier = unsafe { Notifier::from_raw_fd(self.working_fd) };
-        let unstuck_awaiter = unsafe { Awaiter::from_raw_fd(self.unstuck_fd) }?;
-
-        let (tx, rx) = channel();
-        let wq = WriteQueue {
-            #[cfg(feature = "tpc")]
-            inner: Rc::new(UnsafeCell::new(WriteQueueInner {
-                queue: self,
-                pending_tasks: VecDeque::new(),
-                _guard: rx,
-            })),
-            #[cfg(not(feature = "tpc"))]
-            inner: Arc::new(Mutex::new(WriteQueueInner {
-                queue: self,
-                pending_tasks: VecDeque::new(),
-                _guard: rx,
-            })),
-            #[cfg(feature = "tpc")]
-            working_notifier: Rc::new(working_notifier),
-            #[cfg(not(feature = "tpc"))]
-            working_notifier: Arc::new(working_notifier),
-        };
-
-        spawn(wq.clone().unstuck_handler(unstuck_awaiter, tx));
-
-        Ok(wq)
-    }
-
-    #[cfg(all(feature = "tokio", not(feature = "monoio")))]
     pub fn write(self) -> Result<WriteQueue<T>, io::Error>
     where
         T: Send + 'static,
@@ -595,7 +452,6 @@ impl<T> Queue<T> {
         Ok(wq)
     }
 
-    #[cfg(all(feature = "tokio", not(feature = "monoio")))]
     pub fn write_with_tokio_handle(
         self,
         tokio_handle: &tokio::runtime::Handle,
@@ -645,10 +501,6 @@ pub enum PushResult {
 }
 
 pub struct PushJoinHandle {
-    #[cfg(all(feature = "monoio", feature = "tpc"))]
-    waker_slot: Rc<UnsafeCell<WakerSlot>>,
-
-    #[cfg(not(all(feature = "monoio", feature = "tpc")))]
     waker_slot: Arc<Mutex<WakerSlot>>,
 }
 
@@ -659,9 +511,6 @@ impl Future for PushJoinHandle {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        #[cfg(all(feature = "monoio", feature = "tpc"))]
-        let slot = unsafe { &mut *self.waker_slot.get() };
-        #[cfg(not(all(feature = "monoio", feature = "tpc")))]
         let mut slot = self.waker_slot.lock();
         if slot.set_waker(cx.waker()) {
             return std::task::Poll::Ready(());
@@ -769,18 +618,10 @@ mod tests {
 
     use super::*;
 
-    #[cfg(feature = "monoio")]
-    use monoio::time::sleep;
-    #[cfg(all(feature = "tokio", not(feature = "monoio")))]
     use tokio::time::sleep;
 
     macro_rules! test {
         ($($i: item)*) => {$(
-            #[cfg(feature = "monoio")]
-            #[monoio::test(timer_enabled = true)]
-            $i
-
-            #[cfg(all(feature = "tokio", not(feature = "monoio")))]
             #[tokio::test]
             $i
         )*};

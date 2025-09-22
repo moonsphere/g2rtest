@@ -7,6 +7,8 @@ import (
 	"os"
 	"syscall"
 	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 type Notifier struct {
@@ -21,7 +23,7 @@ func (n Notifier) Notify() {
 	val := uint8(0)
 	for {
 		_, e := syscall.Write(int(n.fd), (*(*[1]byte)(unsafe.Pointer(&val)))[:])
-		if e == syscall.EINTR {
+		if e == unix.EINTR {
 			continue
 		}
 		return

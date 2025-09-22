@@ -1,18 +1,11 @@
 // Copyright 2024 ihciah. All Rights Reserved.
 
 use std::{
-    io::{Error, ErrorKind},
+    io::Error,
     os::fd::{AsRawFd, FromRawFd, RawFd},
 };
 
-#[cfg(feature = "monoio")]
-use monoio::{buf::RawBuf, io::AsyncReadRent, net::UnixStream};
-
-#[cfg(all(feature = "tokio", not(feature = "monoio")))]
-use {std::os::unix::io::OwnedFd, tokio::io::unix::AsyncFd};
-
-#[cfg(feature = "monoio")]
-compile_error!("mem-ring monoio feature should be disabled for this build");
+use tokio::{io::AsyncReadExt, net::UnixStream};
 
 pub(crate) fn new_pair() -> Result<(RawFd, RawFd), Error> {
     // create unix stream pair
@@ -84,12 +77,6 @@ pub(crate) struct Notifier {
     fd: RawFd,
 }
 
-#[cfg(all(feature = "tokio", not(feature = "monoio")))]
-pub(crate) struct Awaiter {
-    async_fd: AsyncFd<OwnedFd>,
-}
-
-#[cfg(feature = "monoio")]
 pub(crate) struct Awaiter {
     unix_stream: UnixStream,
 }
@@ -100,14 +87,6 @@ impl AsRawFd for Notifier {
     }
 }
 
-#[cfg(all(feature = "tokio", not(feature = "monoio")))]
-impl AsRawFd for Awaiter {
-    fn as_raw_fd(&self) -> RawFd {
-        self.async_fd.get_ref().as_raw_fd()
-    }
-}
-
-#[cfg(feature = "monoio")]
 impl AsRawFd for Awaiter {
     fn as_raw_fd(&self) -> RawFd {
         self.unix_stream.as_raw_fd()
@@ -149,64 +128,15 @@ impl Awaiter {
         Ok((unsafe { Self::from_raw_fd(fd) }?, peer))
     }
 
-    #[cfg(all(feature = "tokio", not(feature = "monoio")))]
-    pub(crate) unsafe fn from_raw_fd(fd: RawFd) -> Result<Self, Error> {
-        let owned = OwnedFd::from_raw_fd(fd);
-        let async_fd = AsyncFd::new(owned)?;
-        Ok(Self { async_fd })
-    }
-
-    #[cfg(feature = "monoio")]
     pub(crate) unsafe fn from_raw_fd(fd: RawFd) -> Result<Self, Error> {
         let std_unix_stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
         let unix_stream = UnixStream::from_std(std_unix_stream)?;
         Ok(Self { unix_stream })
     }
 
-    #[cfg(feature = "monoio")]
     pub(crate) async fn wait(&mut self) {
-        use std::cell::UnsafeCell;
-        thread_local! {
-            pub static BUF: UnsafeCell<Vec<u8>> = UnsafeCell::new(vec![0; 64]);
-        }
-        let buf = BUF.with(|buf| {
-            let buf = unsafe { &(*buf.get()) };
-            unsafe { RawBuf::new(buf.as_ptr(), buf.len()) }
-        });
-        let _ = self.unix_stream.read(buf).await;
-    }
-
-    #[cfg(all(feature = "tokio", not(feature = "monoio")))]
-    pub(crate) async fn wait(&mut self) {
-        loop {
-            let mut readiness = match self.async_fd.readable_mut().await {
-                Ok(r) => r,
-                Err(_) => return,
-            };
-            let result = readiness.try_io(|inner| {
-                let fd = inner.get_ref().as_raw_fd();
-                let mut buf: [u8; 64] = [0; 64];
-                loop {
-                    let read_bytes =
-                        unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-                    if read_bytes >= 0 {
-                        return Ok(());
-                    }
-                    let err = Error::last_os_error();
-                    if err.kind() == ErrorKind::Interrupted {
-                        continue;
-                    }
-                    if err.kind() == ErrorKind::WouldBlock {
-                        return Err(err);
-                    }
-                    return Ok(());
-                }
-            });
-            match result {
-                Ok(_) => return,
-                Err(_would_block) => continue,
-            }
-        }
+        let mut buf: [u8; 64] = [0; 64];
+        let _ = self.unix_stream.read(&mut buf).await;
     }
 }
 
